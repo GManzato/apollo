@@ -2,7 +2,14 @@ import { Meteor } from 'meteor/meteor';
 import { db } from 'meteor/cultofcoders:grapher';
 import { WebApp } from 'meteor/webapp';
 import { ApolloServer } from 'apollo-server-express';
+import { SubscriptionServer } from 'subscriptions-transport-ws';
+import { execute, subscribe } from 'graphql';
+
+
 import { getSchema } from 'graphql-load';
+import { makeExecutableSchema } from 'graphql-tools';
+import { parse as urlParse } from 'url';
+
 import { AUTH_TOKEN_KEY } from '../constants';
 import defaultSchemaDirectives from './directives';
 import { getUserForContext } from './core/users';
@@ -24,7 +31,7 @@ export default function initialize(apolloConfig = {}, meteorApolloConfig = {}) {
         emails: 1,
       },
     },
-    meteorApolloConfig
+    meteorApolloConfig,
   );
 
   const { typeDefs, resolvers } = getSchema();
@@ -40,16 +47,19 @@ export default function initialize(apolloConfig = {}, meteorApolloConfig = {}) {
       path: e.path,
     }),
     ...initialApolloConfig,
-    typeDefs,
-    resolvers,
-    schemaDirectives: {
-      ...defaultSchemaDirectives,
-      ...(initialApolloConfig.schemaDirectives
-        ? initialApolloConfig.schemaDirectives
-        : []),
-    },
+    schema: makeExecutableSchema({
+      typeDefs,
+      resolvers,
+      allowUndefinedInResolve: true,
+      schemaDirectives: {
+        ...defaultSchemaDirectives,
+        ...(initialApolloConfig.schemaDirectives
+          ? initialApolloConfig.schemaDirectives
+          : []),
+      },
+    }),
     context: getContextCreator(meteorApolloConfig, initialApolloConfig.context),
-    subscriptions: getSubscriptionConfig(meteorApolloConfig),
+    // subscriptions: getSubscriptionConfig(meteorApolloConfig),
   };
 
   const server = new ApolloServer(apolloConfig);
@@ -59,11 +69,58 @@ export default function initialize(apolloConfig = {}, meteorApolloConfig = {}) {
     gui: meteorApolloConfig.gui,
   });
 
-  server.installSubscriptionHandlers(WebApp.httpServer);
+  // server.installSubscriptionHandlers(WebApp.httpServer);
 
-  meteorApolloConfig.middlewares.forEach(middleware => {
+  meteorApolloConfig.middlewares.forEach((middleware) => {
     WebApp.connectHandlers.use('/graphql', middleware);
   });
+
+
+  const subscriptionServer = SubscriptionServer.create(
+    {
+      schema: makeExecutableSchema({
+        typeDefs,
+        resolvers,
+        allowUndefinedInResolve: true,
+        schemaDirectives: {
+          ...defaultSchemaDirectives,
+          ...(initialApolloConfig.schemaDirectives
+            ? initialApolloConfig.schemaDirectives
+            : []),
+        },
+      }),
+      execute,
+      subscribe,
+      onConnect: (connectionParams, webSocket) => ({ db }),
+    },
+    {
+      noServer: true,
+    },
+  );
+
+  const { wsServer } = subscriptionServer;
+
+  const websocketFallback = (req, socket, head) => {
+    if (socket.destroy) {
+      socket.destroy();
+    }
+  }
+
+  const upgradeHandler = (req, socket, head) => {
+    const { pathname } = urlParse(req.url);
+
+    if (pathname === '/graphql') {
+      wsServer.handleUpgrade(req, socket, head, (ws) => {
+        wsServer.emit('connection', ws, req);
+      });
+    } else if (pathname.startsWith('/sockjs')) {
+      // Don't do anything, this is meteor socket.
+    } else {
+      websocketFallback(req, socket, head);
+    }
+  };
+  WebApp.httpServer.on('upgrade', upgradeHandler);
+
 
   // We are doing this work-around because Playground sets headers and WebApp also sets headers
   // Resulting into a conflict and a server side exception of "Headers already sent"
@@ -91,23 +148,22 @@ function getContextCreator(meteorApolloConfig, defaultContextResolver) {
         ...defaultContext,
         ...connection.context,
       };
-    } else {
-      let userContext = {};
-      if (Package['accounts-base']) {
-        const loginToken =
+    }
+    let userContext = {};
+    if (Package['accounts-base']) {
+      const loginToken =
           req.headers['meteor-login-token'] ||
           req.cookies['meteor-login-token'];
-        userContext = await getUserForContext(
-          loginToken,
-          meteorApolloConfig.userFields
-        );
-      }
-
-      return {
-        ...defaultContext,
-        ...userContext,
-      };
+      userContext = await getUserForContext(
+        loginToken,
+        meteorApolloConfig.userFields,
+      );
     }
+
+    return {
+      ...defaultContext,
+      ...userContext,
+    };
   };
 }
 
@@ -120,8 +176,8 @@ function getSubscriptionConfig(meteorApolloConfig) {
         if (loginToken) {
           const userContext = getUserForContext(
             loginToken,
-            meteorApolloConfig.userFields
-          ).then(userContext => {
+            meteorApolloConfig.userFields,
+          ).then((userContext) => {
             resolve(userContext);
           });
         } else {
