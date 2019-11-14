@@ -64,11 +64,57 @@ export default function initialize(apolloConfig = {}, meteorApolloConfig = {}) {
     gui: meteorApolloConfig.gui,
   });
 
-  server.installSubscriptionHandlers(WebApp.httpServer);
+  //server.installSubscriptionHandlers(WebApp.httpServer);
 
   meteorApolloConfig.middlewares.forEach(middleware => {
     WebApp.connectHandlers.use('/graphql', middleware);
   });
+
+  const subscriptionServer = SubscriptionServer.create(
+    {
+      schema: makeExecutableSchema({
+        typeDefs,
+        resolvers,
+        allowUndefinedInResolve: true,
+        schemaDirectives: {
+          ...defaultSchemaDirectives,
+          ...(initialApolloConfig.schemaDirectives
+            ? initialApolloConfig.schemaDirectives
+            : []),
+        },
+      }),
+      execute,
+      subscribe,
+      onConnect: (connectionParams, webSocket) => ({ db }),
+    },
+    {
+      noServer: true,
+    },
+  );
+
+  const { wsServer } = subscriptionServer;
+
+  const websocketFallback = (req, socket, head) => {
+    if (socket.destroy) {
+      socket.destroy();
+    }
+  }
+
+  const upgradeHandler = (req, socket, head) => {
+    const { pathname } = urlParse(req.url);
+
+    if (pathname === '/graphql') {
+      wsServer.handleUpgrade(req, socket, head, (ws) => {
+        wsServer.emit('connection', ws, req);
+      });
+    } else if (pathname.startsWith('/sockjs')) {
+      // Don't do anything, this is meteor socket.
+    } else {
+      websocketFallback(req, socket, head);
+    }
+  };
+  WebApp.httpServer.on('upgrade', upgradeHandler);
+
 
   // We are doing this work-around because Playground sets headers and WebApp also sets headers
   // Resulting into a conflict and a server side exception of "Headers already sent"
